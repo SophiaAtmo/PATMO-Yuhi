@@ -299,6 +299,9 @@ program test
   call patmo_dumpHydrostaticProfile("hydrostatEnd.out")
   call patmo_dumpJValue("jvalue.dat")
 
+  !dump diffusion transport rates
+  call patmo_dumpAllDiffusionToFile("Transport_final.csv")
+
 end program test
 !**************
 subroutine computewetdep(i,heff)

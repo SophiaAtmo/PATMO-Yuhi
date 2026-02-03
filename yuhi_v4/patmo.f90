@@ -1417,5 +1417,92 @@ end function
 
  end subroutine patmo_dumpAllNumberDensityDifference
 
+  subroutine patmo_dumpAllDiffusionToFile(fname)
+    use patmo_commons
+    use patmo_parameters
+    use patmo_constants
+    use patmo_utils
+    implicit none
+    character(len=*),intent(in)::fname
+    character(len=maxNameLength)::names(speciesNumber)
+    integer::j,s
+    real*8::b
+
+    ! local arrays, computed following patmo_ode:fex
+    real*8::d_hp(cellsNumber,chemSpeciesNumber)
+    real*8::k_hp(cellsNumber)
+    real*8::dzz_hp(cellsNumber),kzz_hp(cellsNumber)
+    real*8::Tgas(cellsNumber),Tgas_hp(cellsNumber),Tgas_p(cellsNumber)
+    real*8::ngas(cellsNumber),ngas_hp(cellsNumber),ngas_p(cellsNumber)
+    real*8::ngas_hpp(cellsNumber),ngas_hpz(cellsNumber)
+    real*8::therm_hp(cellsNumber),dzzh_hp(cellsNumber),iTgas_hp(cellsNumber)
+    real*8::prem(cellsNumber)
+    real*8::m(speciesNumber)
+    real*8::n_p(cellsNumber,chemSpeciesNumber)
+
+    names(:) = getSpeciesNames()
+
+    ! base state used in fex
+    m(:)    = getSpeciesMass()
+    Tgas(:) = TgasAll(:)
+    ngas(:) = ntotAll(:)
+
+    ! forward half level values, same as fex
+    do j=1,cellsNumber-1
+      dzz_hp(j)   = 0.5d0*(diffusionDzz(j)+diffusionDzz(j+1))
+      kzz_hp(j)   = 0.5d0*(eddyKzz(j)+eddyKzz(j+1))
+      Tgas_hp(j)  = 0.5d0*(Tgas(j)+Tgas(j+1))
+      Tgas_p(j)   = Tgas(j+1)
+      ngas_p(j)   = ngas(j+1)
+      ngas_hp(j)  = 0.5d0*(ngas(j)+ngas(j+1))
+      n_p(j,:)    = nall(j+1,1:chemSpeciesNumber)
+    end do
+
+    ! boundary, same copy strategy as fex
+    dzz_hp(cellsNumber)  = 0d0
+    kzz_hp(cellsNumber)  = 0d0
+    Tgas_hp(cellsNumber) = Tgas_hp(cellsNumber-1)
+    Tgas_p(cellsNumber)  = Tgas_p(cellsNumber-1)
+    ngas_p(cellsNumber)  = ngas_p(cellsNumber-1)
+    ngas_hp(cellsNumber) = ngas_hp(cellsNumber-1)
+    n_p(cellsNumber,:)   = n_p(cellsNumber-1,:)
+
+    ! d_hp and k_hp, same as fex
+    therm_hp(:) = thermalDiffusionFactor/Tgas_hp(:)*(Tgas_p(:)-Tgas(:))
+    dzzh_hp(:)  = 0.5d0*dzz_hp(:)*idh2(:)
+    iTgas_hp(:) = 1d0/Tgas_hp(:)
+
+    do s=1,chemSpeciesNumber
+      prem(:) = (meanMolecularMass-m(s))*gravity/kboltzmann*gridSpace(:)
+      d_hp(:,s) = dzzh_hp(:) * ( prem(:)*iTgas_hp(:) - therm_hp(:) )
+    end do
+
+    k_hp(:) = (kzz_hp(:)+dzz_hp(:))*idh2(:)
+
+    ngas_hpp(:) = ngas_hp(:)/ngas_p(:)
+    ngas_hpz(:) = ngas_hp(:)/ngas(:)
+
+    open(22,file=trim(fname),status="replace")
+
+    ! header
+    write(22,'(A)',advance="no") "alt_km"
+    do s=1,chemSpeciesNumber
+      write(22,'(A)',advance="no") ","//trim(names(s))
+    end do
+    write(22,*)
+
+    ! data rows
+    do j=1,cellsNumber
+      write(22,'(F12.6)',advance="no") height(j)/1d5
+      do s=1,chemSpeciesNumber
+        b = (k_hp(j)-d_hp(j,s)) * ngas_hpp(j) * n_p(j,s) &
+          - (k_hp(j)+d_hp(j,s)) * ngas_hpz(j) * nall(j,s)
+        write(22,'(",",E17.8)',advance="no") b
+      end do
+      write(22,*)
+    end do
+
+    close(22)
+  end subroutine patmo_dumpAllDiffusionToFile
 
 end module patmo
