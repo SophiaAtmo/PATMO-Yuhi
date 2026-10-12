@@ -1,19 +1,37 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# --- Prompt user for subfolder name under ./tests ---
-while true; do
-  read -r -p "[?] Enter the folder name you prepared under ./tests folder: " USER_SUBDIR
-  if [[ -n "${USER_SUBDIR// }" ]]; then
-    break
-  fi
-  echo "[-] Folder name cannot be empty. Please try again."
-done
+# --- Locate this case and the PATMO root independently of the caller's cwd ---
+BASE_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd -- "${BASE_DIR}/../.." && pwd)"
+USER_SUBDIR="$(basename -- "$BASE_DIR")"
 
-BASE_DIR="./tests/${USER_SUBDIR}"
-if [[ ! -d "$BASE_DIR" ]]; then
-  echo "Folder not found: $BASE_DIR"
-  echo "    Please create it and rerun."
+if [[ ! -f "${PROJECT_ROOT}/patmo" ]]; then
+  echo "PATMO root not found (missing patmo): $PROJECT_ROOT" >&2
+  exit 1
+fi
+
+# PATMO resolves its data, source, and build paths relative to the project root.
+cd -- "$PROJECT_ROOT"
+
+# PATMO uses the database in the project root's data/ directory.
+if [[ ! -d "$PROJECT_ROOT/data" ]]; then
+  echo "PATMO database directory not found: $PROJECT_ROOT/data" >&2
+  exit 1
+fi
+
+for REQUIRED_DATA in \
+  parseReference/reference.dat \
+  thermochemistry/thermochemistry.dat \
+  kida/kida.uva.2014.dat \
+  kida/kida_reac_tb_2015-03-19_1.csv; do
+  if [[ ! -r "$PROJECT_ROOT/data/$REQUIRED_DATA" ]]; then
+    echo "Required PATMO database file missing or unreadable: $PROJECT_ROOT/data/$REQUIRED_DATA" >&2
+    exit 1
+  fi
+done
+if [[ ! -d "$PROJECT_ROOT/data/xsecs_swri" ]]; then
+  echo "PATMO cross-section directory missing: $PROJECT_ROOT/data/xsecs_swri" >&2
   exit 1
 fi
 
@@ -333,7 +351,7 @@ SOLAR_XLSX="${BASE_DIR}/solar_flux.xlsx"
 SOLAR_TXT="${BASE_DIR}/solar_flux.txt"
 OPTIONS_OPT="${BASE_DIR}/options.opt"
 
-echo "[*] Building solar_flux.txt by interpolating to wavelength grid (nm) ..."
+echo "[*] Building solar_flux.txt in increasing energy order (decreasing wavelength) ..."
 
 python3 - "$SOLAR_XLSX" "$SOLAR_TXT" "$OPTIONS_OPT" <<'PY'
 import sys
@@ -404,6 +422,9 @@ lam_src = df["lambda_nm"].to_numpy()
 I_src = df["Iph"].to_numpy()
 I_out = np.interp(lambda_grid,lam_src,I_src,left=0.0,right=0.0)
 
+# E = hc / wavelength: reverse the wavelength-ordered samples for increasing eV.
+I_out = I_out[::-1]
+
 np.savetxt(out_txt,I_out,fmt="%.8e")
 print(f"solar_flux.txt created at: {out_txt}")
 PY
@@ -411,10 +432,156 @@ PY
 echo "solar_flux.txt created successfully."
 
 # -------------------------------
-# Run PATMO test with user-defined folder, then cd ./build
+# Generate PATMO files for the case containing this script
 # -------------------------------
 echo "[*] Running PATMO test with: -test=\"${USER_SUBDIR}\" ..."
-python3 patmo -test="${USER_SUBDIR}"
+python3 - "$USER_SUBDIR" <<'PY'
+from collections import Counter
+import csv
+import math
+from pathlib import Path
+import re
+import runpy
+import shutil
+import sys
 
-echo "[*] Entering ./build ..."
-cd ./build
+case_name = sys.argv[1]
+case_dir = Path("tests") / case_name
+template_dir = case_dir / "templates"
+for name in ("patmo_ode.f90", "patmo_parameters.f90"):
+    if not (template_dir / name).is_file():
+        raise SystemExit(f"Missing Yuhi template: {template_dir / name}")
+
+# A rate written as read:<filename> denotes one scalar per atmospheric layer.
+# Validate these inputs before PATMO starts replacing files in build/.
+options_text = (case_dir / "options.opt").read_text()
+cell_match = re.search(r"^cellsNumber\s*=\s*(\d+)\s*$", options_text, re.M)
+if not cell_match or int(cell_match[1]) < 1:
+    raise SystemExit("options.opt must specify a positive cellsNumber")
+cells_number = int(cell_match[1])
+external_files = []
+rate_column = None
+with (case_dir / "reaction_network.ntw").open(newline="") as handle:
+    for row in csv.reader(handle):
+        if not row or not row[0].strip() or row[0].startswith("#"):
+            continue
+        if row[0].startswith("@format:"):
+            rate_column = [part.strip().lower() for part in row].index("rate")
+            continue
+        if row[0].startswith("@"):
+            continue
+        if rate_column is None or len(row) <= rate_column:
+            raise SystemExit("Invalid reaction_network.ntw format")
+        rate = row[rate_column].strip()
+        if rate.lower() == "read":
+            raise SystemExit(f"Reaction {row[0]}: replace bare read with read:<filename> in Excel")
+        if rate.lower().startswith("read:"):
+            name = rate[5:]
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name):
+                raise SystemExit(f"Invalid external-rate filename: {name!r}")
+            external_files.append(name)
+
+for name in dict.fromkeys(external_files):
+    path = case_dir / name
+    if not path.is_file():
+        raise SystemExit(f"External-rate file not found: {path}")
+    rows = [line.strip() for line in path.read_text().splitlines() if line.strip()]
+    if len(rows) != cells_number:
+        raise SystemExit(f"{path}: expected {cells_number} rate values, found {len(rows)}")
+    for layer, value in enumerate(rows, 1):
+        try:
+            number = float(value.replace("D", "e").replace("d", "e"))
+        except ValueError:
+            raise SystemExit(f"{path}: layer {layer} must contain one numeric rate")
+        if not math.isfinite(number) or number < 0:
+            raise SystemExit(f"{path}: layer {layer} must contain a finite, nonnegative rate")
+
+# Keep newly referenced rate files in the generated copy list as well.
+copylist_path = case_dir / "copylist.pcp"
+copylist = copylist_path.read_text().splitlines()
+for name in dict.fromkeys(external_files):
+    if name not in copylist:
+        copylist.append(name)
+copylist_path.write_text("\n".join(copylist) + "\n")
+
+# Use case-local templates without replacing the shared generator sources.
+sys.path.insert(0, str(Path("src_py").resolve()))
+import patmo_string
+
+default_file_replace = patmo_string.fileReplaceBuild
+def build_case_template(source_file, destination_file, *args, **kwargs):
+    source = Path(source_file)
+    override = template_dir / source.name
+    if source.parent == Path("src_f90") and override.is_file():
+        source_file = str(override)
+    return default_file_replace(source_file, destination_file, *args, **kwargs)
+
+patmo_string.fileReplaceBuild = build_case_template
+Path("build").mkdir(exist_ok=True)
+sys.argv = ["patmo", f"-test={case_name}"]
+try:
+    runpy.run_path("patmo", run_name="__main__")
+except SystemExit as exc:
+    # Some generator errors call sys.exit() without a nonzero status.
+    if exc.code is None or exc.code == 0:
+        raise SystemExit("PATMO stopped before generation completed; see the error above.")
+    raise
+
+shutil.copyfile(template_dir / "patmo_parameters.f90", "build/patmo_parameters.f90")
+
+# PATMO supplies the current reaction indices. Convert its file-reference
+# assignments to readers, so reordering the Excel rows cannot misassign rates.
+rates_path = Path("build/patmo_rates.f90")
+rates_source = rates_path.read_text()
+assignment = re.compile(
+    r"^[ \t]*krate\(icell,\s*(\d+)\)\s*=\s*read:([^\s]+)[ \t]*$",
+    re.M | re.I,
+)
+matches = list(assignment.finditer(rates_source))
+if Counter(match[2] for match in matches) != Counter(external_files):
+    raise SystemExit("Generated external-rate references do not match reaction_network.ntw")
+
+if matches:
+    opens, closes = [], []
+    replacements = {}
+    for slot, match in enumerate(matches, 1):
+        reaction_index, name = match[1], match[2]
+        unit = f"rateFileUnits({slot})"
+        opens.extend([
+            f"    open(newunit={unit},file='{name}',status='old',action='read',iostat=rateFileStatus)",
+            "    if (rateFileStatus /= 0) then",
+            f"      write(*,*) 'Cannot open external-rate file: {name}'",
+            "      error stop 1",
+            "    end if",
+        ])
+        replacements[match.start()] = "\n".join([
+            f"      read({unit},*,iostat=rateFileStatus) krate(icell,{reaction_index})",
+            "      if (rateFileStatus /= 0) then",
+            f"        write(*,*) 'Cannot read {name} at layer ', icell",
+            "        error stop 1",
+            "      end if",
+        ])
+        closes.append(f"    close({unit})")
+    rates_source = assignment.sub(lambda match: replacements[match.start()], rates_source)
+
+    def insert_once(pattern, addition, before=False):
+        global rates_source
+        anchor = re.compile(pattern, re.M | re.I)
+        if len(list(anchor.finditer(rates_source))) != 1:
+            raise SystemExit(f"Cannot locate external-rate insertion point: {pattern}")
+        rates_source = anchor.sub(
+            lambda match: addition + "\n" + match[0] if before else match[0] + "\n" + addition,
+            rates_source,
+        )
+
+    insert_once(r"^[ \t]*implicit\s+none[ \t]*$",
+                f"    integer :: rateFileUnits({len(matches)}), rateFileStatus")
+    insert_once(r"^[ \t]*do\s+icell\s*=\s*1\s*,\s*cellsNumber[ \t]*$",
+                "\n".join(opens), before=True)
+    insert_once(r"^[ \t]*end\s+subroutine\s+computeRates[ \t]*$",
+                "\n".join(closes), before=True)
+    rates_path.write_text(rates_source)
+print(f"[*] Generated external-rate readers for {len(matches)} reactions.")
+PY
+
+echo "[*] Generated files are in: ${PROJECT_ROOT}/build"
